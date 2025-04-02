@@ -1,0 +1,94 @@
+import numpy as np
+import pandas as pd
+import talib
+from backtesting import Backtest, Strategy
+from backtesting.lib import crossover
+import matplotlib.pyplot as plt
+from scipy.stats import zscore
+
+class MeanReversionTrendStrategy(Strategy):
+    # Optimizable parameters
+    z_entry_threshold = 2.0
+    z_exit_threshold = 0.5
+    adx_threshold = 25
+    ma_period = 50
+    atr_period = 14
+    risk_per_trade = 0.02  # 2% of equity per trade
+    
+    def init(self):
+        # Indicators
+        ma = self.I(talib.SMA, self.data.Close, self.ma_period)
+        upper, middle, lower = self.I(talib.BBANDS, self.data.Close, 20, 2, 2)
+        adx = self.I(talib.ADX, self.data.High, self.data.Low, self.data.Close, 14)
+        atr = self.I(talib.ATR, self.data.High, self.data.Low, self.data.Close, self.atr_period)
+        
+        # Z-score calculation
+        self.z_score = (self.data.Close - middle) / ((upper - lower)/2)
+        
+        # Trend score components
+        self.trend_strength = adx / 100  # Normalized 0-1
+        self.trend_direction = np.where(self.data.Close > ma, 1, -1)
+        
+    def next(self):
+        current_z = self.z_score[-1]
+        prev_z = self.z_score[-2]
+        
+        # Calculate dynamic position size
+        atr_normalized = self.data.Close[-1] / self.I(talib.ATR, self.data.High, self.data.Low, self.data.Close, self.atr_period)[-1]
+        position_size = (self.risk_per_trade * self.equity) / (atr_normalized * self.z_entry_threshold)
+        
+        # Conflict resolution logic
+        if abs(current_z) >= self.z_entry_threshold:
+            # Strong mean reversion signal
+            if (current_z <= -self.z_entry_threshold and self.trend_direction[-1] > 0) or \
+               (current_z >= self.z_entry_threshold and self.trend_direction[-1] < 0):
+                # Mean reversion aligns with trend - strongest signal
+                if not self.position:
+                    self.buy(size=position_size) if current_z <= -self.z_entry_threshold else self.sell(size=position_size)
+            elif self.trend_strength[-1] < (self.adx_threshold/100):
+                # Weak trend environment - allow counter-trend
+                if not self.position:
+                    self.buy(size=position_size*0.5) if current_z <= -self.z_entry_threshold else self.sell(size=position_size*0.5)
+        
+        # Exit conditions
+        if self.position:
+            if (self.position.is_long and current_z >= -self.z_exit_threshold) or \
+               (self.position.is_short and current_z <= self.z_exit_threshold):
+                self.position.close()
+
+# Load your data (example with Yahoo Finance)
+data = pd.read_csv('your_data.csv', parse_dates=['Date'], index_col='Date')
+data.columns = [c.capitalize() for c in data.columns]  # Open, High, Low, Close, Volume
+
+# Run backtest
+bt = Backtest(data, MeanReversionTrendStrategy, commission=.002, margin=1.0)
+stats = bt.run()
+print(stats)
+
+# Optimization
+param_grid = {
+    'z_entry_threshold': [1.8, 2.0, 2.2],
+    'z_exit_threshold': [0.3, 0.5, 0.7],
+    'adx_threshold': [20, 25, 30],
+    'ma_period': [30, 50, 70]
+}
+optimized_stats = bt.optimize(**param_grid, maximize='Return [%]')
+print(optimized_stats)
+
+# Visualization
+bt.plot(resample=False)
+plt.show()
+
+# Probability analysis
+win_rates = []
+for z in np.linspace(1.5, 3.0, 10):
+    temp_stats = bt.run(z_entry_threshold=z)
+    win_rates.append(temp_stats['Win Rate [%]'] / 100)
+
+plt.figure(figsize=(10,5))
+plt.plot(np.linspace(1.5, 3.0, 10), win_rates)
+plt.title('Win Rate vs Z-Score Threshold')
+plt.xlabel('Z-Score Entry Threshold')
+plt.ylabel('Win Rate')
+plt.grid()
+plt.show()
